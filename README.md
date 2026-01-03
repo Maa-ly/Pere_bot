@@ -11,6 +11,8 @@
 -- storage handling -- done
 -- competition handling -- progress
 -- spoting speeed
+-- reactive network more research
+-- oracle Implementation  and research ---
 
 
 
