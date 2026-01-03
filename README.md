@@ -7,10 +7,12 @@
 
 
 ## Todo
--- event scraping
--- storage handling
--- competition handling
+-- event scraping -- done
+-- storage handling -- done
+-- competition handling -- progress
 -- spoting speeed
+-- reactive network more research
+-- oracle Implementation  and research ---
 
 
 
@@ -18,3 +20,28 @@
 ## liquidation math
 Margin & Liquidations
 Margin
+
+
+┌─────────────────────────────────────────────────────────────────┐
+│                         SENTINEL                                 │
+│  • Watches: Market events, Oracle updates, Executor events       │
+│  • Multi-batch: batchesPerTrigger for coverage                  │
+│  • Chain-aware: Separate origin/destination chains              │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ Callback
+┌─────────────────────────────────────────────────────────────────┐
+│                         EXECUTOR                                 │
+│                                                                  │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │
+│  │  ASSESS     │───▶│  VALIDATE   │───▶│  EXECUTE            │  │
+│  │  Position   │    │  • Oracle   │    │  • Direct or Flash  │  │
+│  │  Factors    │    │  • Solvency │    │  • Profit check     │  │
+│  │             │    │  • Profit   │    │  • Transfer reward  │  │
+│  └─────────────┘    └─────────────┘    └─────────────────────┘  │
+│                                                                  │
+│  Safety Features:                                                │
+│  ✓ Oracle staleness check       ✓ Insolvency skip               │
+│  ✓ Maker higher buffer          ✓ Dynamic gas estimation        │
+│  ✓ Realized profit verification ✓ L2 gas oracle support         │
+└─────────────────────────────────────────────────────────────────┘
