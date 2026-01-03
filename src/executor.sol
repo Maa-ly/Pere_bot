@@ -21,6 +21,7 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
     uint256 public gasEstimateForLiquidation;
     uint256 public gasWeiPerAssetUnit;
     address public arbGasInfo;
+    address public opGasPriceOracle;
     bool public useDynamicGasCost;
     uint256 public rewardDiscountPpm;
     uint256 public minProfit;
@@ -28,6 +29,7 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
     uint256 public makerLiquidationBuffer;
     uint256 public minMakerSize;
     uint256 public makerRewardDiscountPpm;
+    uint256 public insolvencyThresholdMultiplier;
 
     mapping(address => mapping(address => bool)) public isTracked;
     mapping(address => address[]) public trackedAccounts;
@@ -63,6 +65,7 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         int256 cushion;
         uint256 liquidationFeeRatio;
         uint256 reward;
+        bool isInsolvent;
     }
 
     event RealizedPayout(address indexed market, address indexed account, address indexed asset, uint256 amount);
@@ -75,6 +78,7 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         int256 equity
     );
     event LiquidationExecuted(address indexed market, address indexed account, bool viaFlashLoan, uint256 reward);
+    event LowProfitExecution(address indexed market, address indexed account, uint256 gained, uint256 cost);
     event PositionFactors(address indexed market, address indexed account, bytes data);
 
     error NotOwner();
@@ -102,6 +106,7 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         gasEstimateForLiquidation = 0;
         gasWeiPerAssetUnit = 0;
         arbGasInfo = address(0);
+        opGasPriceOracle = address(0);
         useDynamicGasCost = true;
         rewardDiscountPpm = 0;
         minProfit = 0;
@@ -109,6 +114,7 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         makerLiquidationBuffer = 1_150_000;
         minMakerSize = 0;
         makerRewardDiscountPpm = 200_000;
+        insolvencyThresholdMultiplier = 2_000_000;
     }
 
     modifier onlyOwner() {
@@ -149,6 +155,10 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         arbGasInfo = newArbGasInfo;
     }
 
+    function setOpGasPriceOracle(address newOpGasPriceOracle) external onlyOwner {
+        opGasPriceOracle = newOpGasPriceOracle;
+    }
+
     function setUseDynamicGasCost(bool newUseDynamicGasCost) external onlyOwner {
         useDynamicGasCost = newUseDynamicGasCost;
     }
@@ -175,6 +185,10 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
 
     function setMakerRewardDiscountPpm(uint256 newMakerRewardDiscountPpm) external onlyOwner {
         makerRewardDiscountPpm = newMakerRewardDiscountPpm;
+    }
+
+    function setInsolvencyThresholdMultiplier(uint256 newInsolvencyThresholdMultiplier) external onlyOwner {
+        insolvencyThresholdMultiplier = newInsolvencyThresholdMultiplier;
     }
 
     function oraclePrice(IMarket market) public view returns (int256) {
@@ -290,6 +304,25 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
                 f.reward = (f.reward * (ONE_HUNDRED_PERCENT - makerRewardDiscountPpm)) / ONE_HUNDRED_PERCENT;
             }
         }
+
+        if (f.notional != 0 && insolvencyThresholdMultiplier != 0) {
+            uint256 threshold = (f.maintenanceRequirement * insolvencyThresholdMultiplier) / ONE_HUNDRED_PERCENT;
+            if (threshold > uint256(type(int256).max)) {
+                f.isInsolvent = true;
+            } else {
+                if (f.equityValue == type(int256).min) {
+                    f.isInsolvent = true;
+                } else if (f.equityValue < 0) {
+                    f.isInsolvent = uint256(-f.equityValue) > threshold;
+                } else {
+                    f.isInsolvent = false;
+                }
+            }
+            if (f.isInsolvent) {
+                f.liquidatable = false;
+                f.reward = 0;
+            }
+        }
     }
 
     function isLiquidatable(int256 equity_, uint256 maintenance_, uint256 buffer) public pure returns (bool) {
@@ -321,6 +354,14 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
             if (ok && ret.length >= 32 * 6) {
                 (uint256 perL2Tx,,,,,) = abi.decode(ret, (uint256, uint256, uint256, uint256, uint256, uint256));
                 totalWei += perL2Tx;
+            }
+        }
+        if (opGasPriceOracle != address(0)) {
+            bytes memory estimatedCalldata = new bytes(500);
+            (bool ok, bytes memory ret) =
+                opGasPriceOracle.staticcall(abi.encodeWithSignature("getL1Fee(bytes)", estimatedCalldata));
+            if (ok && ret.length >= 32) {
+                totalWei += abi.decode(ret, (uint256));
             }
         }
         return totalWei / gasWeiPerAssetUnit;
@@ -360,8 +401,12 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         try IMarket(market).claimFee(address(this)) {} catch {}
         if (asset != address(0)) {
             uint256 balanceAfter = _balanceOf(asset, address(this));
-            if (balanceAfter > balanceBefore) {
-                uint256 gained = balanceAfter - balanceBefore;
+            uint256 gained = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0;
+            uint256 cost = gasCost() + safetyMargin + minProfit;
+            if (gained < cost) {
+                emit LowProfitExecution(market, account, gained, cost);
+            }
+            if (gained != 0) {
                 _transfer(asset, profitReceiver, gained);
                 emit RealizedPayout(market, account, asset, gained);
             }

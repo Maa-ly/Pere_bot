@@ -2,6 +2,7 @@
 pragma solidity ^0.8.29;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {Executor} from "../src/executor.sol";
 import {Sentinal} from "../src/reactive/sentinal.sol";
 import {IReactive} from "lib/reactive-lib/src/interfaces/IReactive.sol";
@@ -35,6 +36,18 @@ contract MockOracle is IOracleProvider {
 
     function at(uint256) external view returns (OracleVersion memory) {
         return _latest;
+    }
+}
+
+contract MockOpGasPriceOracle {
+    uint256 public l1Fee;
+
+    constructor(uint256 l1Fee_) {
+        l1Fee = l1Fee_;
+    }
+
+    function getL1Fee(bytes calldata) external view returns (uint256) {
+        return l1Fee;
     }
 }
 
@@ -270,6 +283,7 @@ contract MockMarketWithFee is IMarket {
 
 contract BotTest is Test {
     event RealizedPayout(address indexed market, address indexed account, address indexed asset, uint256 amount);
+    event LowProfitExecution(address indexed market, address indexed account, uint256 gained, uint256 cost);
 
     function test_dynamic_gas_cost_calculation() external {
         Executor executor = new Executor(address(this), address(0xBEEF), address(0xCAFE));
@@ -277,6 +291,50 @@ contract BotTest is Test {
         executor.setGasWeiPerAssetUnit(1);
         vm.txGasPrice(10 gwei);
         assertEq(executor.estimateGasCost(), 300_000 * 10 gwei);
+    }
+
+    function test_op_stack_l1_fee_is_included_in_gas_cost() external {
+        Executor executor = new Executor(address(this), address(0xBEEF), address(0xCAFE));
+        MockOpGasPriceOracle oracle = new MockOpGasPriceOracle(1000);
+        executor.setOpGasPriceOracle(address(oracle));
+        executor.setGasEstimateForLiquidation(10);
+        executor.setGasWeiPerAssetUnit(1);
+        vm.txGasPrice(2);
+        assertEq(executor.estimateGasCost(), 2 * 10 + 1000);
+    }
+
+    function test_insolvent_positions_are_skipped() external {
+        Executor executor = new Executor(address(this), address(0xBEEF), address(0xCAFE));
+        executor.setInsolvencyThresholdMultiplier(2_000_000);
+
+        MockOracle oracle = new MockOracle();
+        MockMarket market = new MockMarket(oracle);
+        address account = address(0xA11CE);
+
+        RiskParameter memory r;
+        r.maintenance = UFixed6.wrap(100_000);
+        r.minMaintenance = UFixed6.wrap(0);
+        r.liquidationFee = UFixed6.wrap(50_000);
+        market.setRiskParameter(r);
+
+        OracleVersion memory v;
+        v.price = Fixed6.wrap(int256(2_000_000));
+        v.valid = true;
+        v.timestamp = block.timestamp;
+        oracle.setStatus(v, block.timestamp);
+
+        Position memory p;
+        p.size = Fixed6.wrap(int256(1_000_000));
+        p.entryPrice = Fixed6.wrap(int256(2_000_000));
+        market.setPosition(account, p);
+
+        Local memory l;
+        l.collateral = Fixed6.wrap(-int256(500_000));
+        market.setLocal(account, l);
+
+        (bool liquidatable,, uint256 reward,) = executor.assess(IMarket(address(market)), account);
+        assertEq(liquidatable, false);
+        assertEq(reward, 0);
     }
 
     function test_maker_buffer_and_reward_discount_applied() external {
@@ -413,6 +471,7 @@ contract BotTest is Test {
 
     function test_executor_math_and_liquidation_check() external {
         Executor executor = new Executor(address(this), address(0xBEEF), address(0xCAFE));
+        executor.setInsolvencyThresholdMultiplier(0);
         MockOracle oracle = new MockOracle();
         MockMarket market = new MockMarket(oracle);
         address account = address(0xA11CE);
@@ -522,6 +581,7 @@ contract BotTest is Test {
 
     function test_executor_applies_min_maintenance() external {
         Executor executor = new Executor(address(this), address(0xBEEF), address(0xCAFE));
+        executor.setInsolvencyThresholdMultiplier(0);
         MockOracle oracle = new MockOracle();
         MockMarket market = new MockMarket(oracle);
         address account = address(0xA11CE);
@@ -588,6 +648,7 @@ contract BotTest is Test {
 
     function test_executor_tracks_accounts_and_batches() external {
         Executor executor = new Executor(address(this), address(0xBEEF), address(0xCAFE));
+        executor.setInsolvencyThresholdMultiplier(0);
         MockOracle oracle = new MockOracle();
         MockMarket market = new MockMarket(oracle);
         address a = address(0xA11CE);
@@ -792,6 +853,7 @@ contract BotTest is Test {
     function test_direct_liquidation_routes_realized_payout() external {
         MockERC20 token = new MockERC20();
         Executor executor = new Executor(address(this), address(0xBEEF), address(0xCAFE));
+        executor.setInsolvencyThresholdMultiplier(0);
         MockOracle oracle = new MockOracle();
         MockMarketWithFee market = new MockMarketWithFee(oracle, token);
 
@@ -831,12 +893,64 @@ contract BotTest is Test {
         assertEq(token.balanceOf(address(executor)), 0);
     }
 
+    function test_non_flash_path_emits_low_profit_execution_when_realized_is_low() external {
+        MockERC20 token = new MockERC20();
+        Executor executor = new Executor(address(this), address(0xBEEF), address(0xCAFE));
+        executor.setInsolvencyThresholdMultiplier(0);
+        executor.setGasEstimateForLiquidation(1);
+        executor.setGasWeiPerAssetUnit(1);
+        vm.txGasPrice(1);
+
+        MockOracle oracle = new MockOracle();
+        MockMarketWithFee market = new MockMarketWithFee(oracle, token);
+
+        RiskParameter memory r;
+        r.maintenance = UFixed6.wrap(10_000);
+        r.minMaintenance = UFixed6.wrap(0);
+        r.liquidationFee = UFixed6.wrap(50_000);
+        market.setRiskParameter(r);
+
+        OracleVersion memory v;
+        v.price = Fixed6.wrap(int256(2_000_000));
+        v.valid = true;
+        v.timestamp = block.timestamp;
+        oracle.setStatus(v, block.timestamp);
+
+        Position memory p;
+        p.size = Fixed6.wrap(int256(1_000_000));
+        p.entryPrice = Fixed6.wrap(int256(3_000_000));
+
+        Local memory l;
+        l.collateral = Fixed6.wrap(int256(0));
+
+        market.setFeeAmount(0);
+
+        address account = address(0xA11CE);
+        market.setPosition(account, p);
+        market.setLocal(account, l);
+
+        vm.recordLogs();
+        executor.checkAndExecute(address(this), address(market), account);
+
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        bytes32 want = keccak256("LowProfitExecution(address,address,uint256,uint256)");
+        bool found;
+        for (uint256 i = 0; i < entries.length; i++) {
+            if (entries[i].topics.length != 0 && entries[i].topics[0] == want) {
+                found = true;
+                break;
+            }
+        }
+        assertTrue(found);
+    }
+
     function test_flashloan_repay_and_profit_routing() external {
         MockERC20 token = new MockERC20();
         MockAavePool pool = new MockAavePool(10);
         token.mint(address(pool), 1_000_000);
 
         Executor executor = new Executor(address(this), address(pool), address(0xCAFE));
+        executor.setInsolvencyThresholdMultiplier(0);
         MockOracle oracle = new MockOracle();
         MockMarketWithFee market = new MockMarketWithFee(oracle, token);
         address account = address(0xA11CE);
@@ -876,6 +990,7 @@ contract BotTest is Test {
         token.mint(address(pool), 1_000_000);
 
         Executor executor = new Executor(address(this), address(pool), address(0xCAFE));
+        executor.setInsolvencyThresholdMultiplier(0);
         MockOracle oracle = new MockOracle();
         MockMarketWithFee market = new MockMarketWithFee(oracle, token);
         address account = address(0xA11CE);
