@@ -257,6 +257,7 @@ contract BotTest is Test {
 
         RiskParameter memory r;
         r.maintenance = UFixed6.wrap(10_000);
+        r.minMaintenance = UFixed6.wrap(0);
         r.liquidationFee = UFixed6.wrap(50_000);
         market.setRiskParameter(r);
 
@@ -284,6 +285,70 @@ contract BotTest is Test {
         assertEq(eq, -1_000_000);
     }
 
+    function test_executor_applies_min_maintenance() external {
+        Executor executor = new Executor(address(this), address(0xBEEF), address(0xCAFE));
+        MockOracle oracle = new MockOracle();
+        MockMarket market = new MockMarket(oracle);
+
+        RiskParameter memory r;
+        r.maintenance = UFixed6.wrap(10_000);
+        r.minMaintenance = UFixed6.wrap(30_000);
+        r.liquidationFee = UFixed6.wrap(50_000);
+        market.setRiskParameter(r);
+
+        OracleVersion memory v;
+        v.price = Fixed6.wrap(int256(2_000_000));
+        v.valid = true;
+        v.timestamp = 1;
+        oracle.setStatus(v, 1);
+
+        Position memory p;
+        p.size = Fixed6.wrap(int256(1_000_000));
+        p.entryPrice = Fixed6.wrap(int256(3_000_000));
+        market.setPosition(p);
+
+        Local memory l;
+        l.collateral = Fixed6.wrap(int256(0));
+        market.setLocal(l);
+
+        (bool liquidatable, uint256 maint, uint256 reward,) = executor.assess(market, address(0xA11CE));
+        assertTrue(liquidatable);
+        assertEq(maint, 30_000);
+        assertEq(reward, 1_500);
+    }
+
+    function test_executor_does_not_liquidate_without_position() external {
+        Executor executor = new Executor(address(this), address(0xBEEF), address(0xCAFE));
+        MockOracle oracle = new MockOracle();
+        MockMarket market = new MockMarket(oracle);
+
+        RiskParameter memory r;
+        r.maintenance = UFixed6.wrap(10_000);
+        r.minMaintenance = UFixed6.wrap(30_000);
+        r.liquidationFee = UFixed6.wrap(50_000);
+        market.setRiskParameter(r);
+
+        OracleVersion memory v;
+        v.price = Fixed6.wrap(int256(2_000_000));
+        v.valid = true;
+        v.timestamp = 1;
+        oracle.setStatus(v, 1);
+
+        Position memory p;
+        p.size = Fixed6.wrap(int256(0));
+        p.entryPrice = Fixed6.wrap(int256(3_000_000));
+        market.setPosition(p);
+
+        Local memory l;
+        l.collateral = Fixed6.wrap(int256(-1));
+        market.setLocal(l);
+
+        (bool liquidatable, uint256 maint, uint256 reward,) = executor.assess(market, address(0xA11CE));
+        assertFalse(liquidatable);
+        assertEq(maint, 0);
+        assertEq(reward, 0);
+    }
+
     function test_executor_tracks_accounts_and_batches() external {
         Executor executor = new Executor(address(this), address(0xBEEF), address(0xCAFE));
         MockOracle oracle = new MockOracle();
@@ -291,6 +356,7 @@ contract BotTest is Test {
 
         RiskParameter memory r;
         r.maintenance = UFixed6.wrap(10_000);
+        r.minMaintenance = UFixed6.wrap(0);
         r.liquidationFee = UFixed6.wrap(50_000);
         market.setRiskParameter(r);
 

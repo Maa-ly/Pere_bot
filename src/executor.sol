@@ -28,6 +28,15 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
     mapping(address => mapping(address => uint256)) public lastAccountEventId;
     mapping(address => uint256) public lastBatchEventId;
 
+    event LiquidationCheck(
+        address indexed market,
+        address indexed account,
+        bool liquidatable,
+        uint256 maintenanceRequirement,
+        int256 equity
+    );
+    event LiquidationExecuted(address indexed market, address indexed account, bool viaFlashLoan, uint256 reward);
+
     error NotOwner();
     error InvalidAddress();
     error UnsupportedCallbackSender();
@@ -123,6 +132,16 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         return (notional_ * maintenanceRatio) / ONE_HUNDRED_PERCENT;
     }
 
+    function computeMaintenanceRequirement(uint256 notional_, uint256 maintenanceRatio, uint256 minMaintenance)
+        public
+        pure
+        returns (uint256)
+    {
+        if (notional_ == 0) return 0;
+        uint256 req = (notional_ * maintenanceRatio) / ONE_HUNDRED_PERCENT;
+        return req < minMaintenance ? minMaintenance : req;
+    }
+
     function liquidationReward(uint256 maintenance_, uint256 liquidationFeeRatio) public pure returns (uint256) {
         return (maintenance_ * liquidationFeeRatio) / ONE_HUNDRED_PERCENT;
     }
@@ -151,7 +170,8 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         int256 entryPrice = Fixed6.unwrap(p.entryPrice);
 
         uint256 notional_ = notional(size, price);
-        maintenanceRequirement = maintenance(notional_, UFixed6.unwrap(r.maintenance));
+        maintenanceRequirement =
+            computeMaintenanceRequirement(notional_, UFixed6.unwrap(r.maintenance), UFixed6.unwrap(r.minMaintenance));
         equityValue = equity(
             Fixed6.unwrap(l.collateral),
             size,
@@ -161,8 +181,13 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
             Fixed6.unwrap(p.accruedFees)
         );
 
-        liquidatable = isLiquidatable(equityValue, maintenanceRequirement, liquidationBuffer);
-        reward = liquidationReward(maintenanceRequirement, UFixed6.unwrap(r.liquidationFee));
+        if (notional_ == 0) {
+            liquidatable = false;
+            reward = 0;
+        } else {
+            liquidatable = isLiquidatable(equityValue, maintenanceRequirement, liquidationBuffer);
+            reward = liquidationReward(maintenanceRequirement, UFixed6.unwrap(r.liquidationFee));
+        }
     }
 
     function profitable(uint256 reward, uint256 flashLoanFee) public view returns (bool) {
@@ -180,11 +205,18 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
     }
 
     function _checkAndExecute(address market, address account) internal {
-        (bool liquidatable,, uint256 reward,) = assess(IMarket(market), account);
+        (bool liquidatable, uint256 maintReq, uint256 reward, int256 eq) = assess(IMarket(market), account);
+        emit LiquidationCheck(market, account, liquidatable, maintReq, eq);
         if (!liquidatable) return;
         if (!profitable(reward, 0)) return;
         IMarket(market).update(account, 0, 0, 0, 0, true);
         try IMarket(market).claimFee(profitReceiver) {} catch {}
+        emit LiquidationExecuted(market, account, false, reward);
+    }
+
+    function _hasPosition(address market, address account) internal view returns (bool) {
+        Position memory p = IMarket(market).positions(account);
+        return Fixed6.unwrap(p.size) != 0;
     }
 
     function trackAndCheck(address rvmId, address market, address account)
@@ -192,7 +224,7 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         authorizedSenderOnly
         rvmIdOnly(rvmId)
     {
-        if (account != address(0) && !isTracked[market][account]) {
+        if (account != address(0) && !isTracked[market][account] && _hasPosition(market, account)) {
             isTracked[market][account] = true;
             trackedAccounts[market].push(account);
         }
@@ -215,7 +247,7 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         if (lastAccountEventId[market][account] == eventId) return;
         lastAccountEventId[market][account] = eventId;
 
-        if (account != address(0) && !isTracked[market][account]) {
+        if (account != address(0) && !isTracked[market][account] && _hasPosition(market, account)) {
             isTracked[market][account] = true;
             trackedAccounts[market].push(account);
         }
@@ -270,7 +302,7 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         uint256 estimatedFlashFee = (amount * _flashLoanPremiumTotalBps()) / BPS_DIVISOR;
         if (!profitable(reward, estimatedFlashFee)) return;
 
-        aavePool.flashLoanSimple(address(this), asset, amount, abi.encode(market, account), 0);
+        aavePool.flashLoanSimple(address(this), asset, amount, abi.encode(market, account, reward), 0);
     }
 
     function executeOperation(address asset, uint256 amount, uint256 premium, address initiator, bytes calldata params)
@@ -280,7 +312,7 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         if (msg.sender != address(aavePool)) revert NotAavePool();
         if (initiator != address(this)) revert UnexpectedInitiator();
 
-        (address market, address account) = abi.decode(params, (address, address));
+        (address market, address account, uint256 reward) = abi.decode(params, (address, address, uint256));
         IMarket(market).update(account, 0, 0, 0, 0, true);
         try IMarket(market).claimFee(address(this)) {} catch {}
 
@@ -293,6 +325,7 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         uint256 surplus = balance - repayAmount;
         if (surplus < minProfit) revert InsufficientProfit();
         if (surplus != 0) _transfer(asset, profitReceiver, surplus);
+        emit LiquidationExecuted(market, account, true, reward);
         return true;
     }
 

@@ -11,3 +11,10 @@
 -- storage handling
 -- competition handling
 -- spoting speeed
+
+
+
+
+## liquidation math
+Margin & Liquidations
+Margin
