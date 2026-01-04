@@ -5,10 +5,14 @@ import {AbstractReactive} from "lib/reactive-lib/src/abstract-base/AbstractReact
 import {IReactive} from "lib/reactive-lib/src/interfaces/IReactive.sol";
 
 contract Sentinal is AbstractReactive {
+    uint256 internal constant STORK_VALUE_UPDATE_TOPIC0 = uint256(keccak256("ValueUpdate(bytes32,uint64,int192)"));
+
     uint256 public originChainId;
     uint256 public destinationChainId;
     address public market;
     address public oracle;
+    address public stork;
+    bytes32 public storkAssetId;
     address public executor;
     address public callback;
     uint64 public callbackGasLimit;
@@ -23,6 +27,8 @@ contract Sentinal is AbstractReactive {
         uint256 destinationChainId_,
         address market_,
         address oracle_,
+        address stork_,
+        bytes32 storkAssetId_,
         address executor_,
         address callback_,
         uint64 callbackGasLimit_,
@@ -36,6 +42,8 @@ contract Sentinal is AbstractReactive {
         destinationChainId = destinationChainId_;
         market = market_;
         oracle = oracle_;
+        stork = stork_;
+        storkAssetId = storkAssetId_;
         executor = executor_;
         callback = callback_;
         callbackGasLimit = callbackGasLimit_;
@@ -50,6 +58,16 @@ contract Sentinal is AbstractReactive {
             if (oracle_ != address(0)) {
                 service.subscribe(
                     originChainId_, oracle_, REACTIVE_IGNORE, REACTIVE_IGNORE, REACTIVE_IGNORE, REACTIVE_IGNORE
+                );
+            }
+            if (stork_ != address(0) && storkAssetId_ != bytes32(0)) {
+                service.subscribe(
+                    originChainId_,
+                    stork_,
+                    STORK_VALUE_UPDATE_TOPIC0,
+                    uint256(storkAssetId_),
+                    REACTIVE_IGNORE,
+                    REACTIVE_IGNORE
                 );
             }
             if (executor_ != address(0)) {
@@ -120,6 +138,29 @@ contract Sentinal is AbstractReactive {
             );
             for (uint256 i = 0; i < batchesPerTrigger; i++) {
                 emit Callback(destinationChainId, callback, callbackGasLimit, oraclePayload);
+            }
+            return;
+        }
+        if (
+            stork != address(0) && log._contract == stork && log.topic_0 == STORK_VALUE_UPDATE_TOPIC0
+                && log.topic_1 == uint256(storkAssetId)
+        ) {
+            (uint64 timestampNs, int192 quantizedValue) = abi.decode(log.data, (uint64, int192));
+            bytes memory storkPayload = abi.encodeWithSignature(
+                "storkValueUpdateEvent(address,bytes32,uint64,int192,uint256,uint256,uint256,uint256,uint256,uint256)",
+                address(0),
+                storkAssetId,
+                timestampNs,
+                quantizedValue,
+                batchSize,
+                log.chain_id,
+                log.block_number,
+                log.tx_hash,
+                log.log_index,
+                log.topic_0
+            );
+            for (uint256 i = 0; i < batchesPerTrigger; i++) {
+                emit Callback(destinationChainId, callback, callbackGasLimit, storkPayload);
             }
             return;
         }

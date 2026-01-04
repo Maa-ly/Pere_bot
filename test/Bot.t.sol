@@ -285,6 +285,41 @@ contract BotTest is Test {
     event RealizedPayout(address indexed market, address indexed account, address indexed asset, uint256 amount);
     event LowProfitExecution(address indexed market, address indexed account, uint256 gained, uint256 cost);
 
+    function _emitStorkUpdate(Executor executor, bytes32 assetId, int192 quantizedValue) internal {
+        executor.storkValueUpdateEvent(
+            address(this),
+            assetId,
+            uint64(123),
+            quantizedValue,
+            10,
+            1,
+            7,
+            9,
+            11,
+            uint256(keccak256("ValueUpdate(bytes32,uint64,int192)"))
+        );
+    }
+
+    function _storkCallbackPayload(bytes32 assetId, uint256 batchSize, IReactive.LogRecord memory log)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodeWithSignature(
+            "storkValueUpdateEvent(address,bytes32,uint64,int192,uint256,uint256,uint256,uint256,uint256,uint256)",
+            address(0),
+            assetId,
+            uint64(123),
+            int192(2_000_000),
+            batchSize,
+            log.chain_id,
+            log.block_number,
+            log.tx_hash,
+            log.log_index,
+            log.topic_0
+        );
+    }
+
     function test_dynamic_gas_cost_calculation() external {
         Executor executor = new Executor(address(this), address(0xBEEF), address(0xCAFE));
         executor.setGasEstimateForLiquidation(300_000);
@@ -697,7 +732,18 @@ contract BotTest is Test {
         uint256 cronTopic = 0;
 
         Sentinal sentinal = new Sentinal(
-            originChainId, destinationChainId, market, oracle, executor, callback, gasLimit, cronTopic, 10, 1
+            originChainId,
+            destinationChainId,
+            market,
+            oracle,
+            address(0),
+            bytes32(0),
+            executor,
+            callback,
+            gasLimit,
+            cronTopic,
+            10,
+            1
         );
 
         IReactive.LogRecord memory log;
@@ -738,7 +784,18 @@ contract BotTest is Test {
         uint256 batchSize = 7;
 
         Sentinal sentinal = new Sentinal(
-            originChainId, destinationChainId, market, oracle, executor, callback, gasLimit, cronTopic, batchSize, 1
+            originChainId,
+            destinationChainId,
+            market,
+            oracle,
+            address(0),
+            bytes32(0),
+            executor,
+            callback,
+            gasLimit,
+            cronTopic,
+            batchSize,
+            1
         );
 
         IReactive.LogRecord memory log;
@@ -778,7 +835,18 @@ contract BotTest is Test {
         uint256 batchSize = 7;
 
         Sentinal sentinal = new Sentinal(
-            originChainId, destinationChainId, market, oracle, executor, callback, gasLimit, cronTopic, batchSize, 1
+            originChainId,
+            destinationChainId,
+            market,
+            oracle,
+            address(0),
+            bytes32(0),
+            executor,
+            callback,
+            gasLimit,
+            cronTopic,
+            batchSize,
+            1
         );
 
         IReactive.LogRecord memory log;
@@ -821,7 +889,18 @@ contract BotTest is Test {
         uint256 batchSize = 7;
 
         Sentinal sentinal = new Sentinal(
-            originChainId, destinationChainId, market, oracle, executor, callback, gasLimit, cronTopic, batchSize, 1
+            originChainId,
+            destinationChainId,
+            market,
+            oracle,
+            address(0),
+            bytes32(0),
+            executor,
+            callback,
+            gasLimit,
+            cronTopic,
+            batchSize,
+            1
         );
 
         IReactive.LogRecord memory log;
@@ -848,6 +927,149 @@ contract BotTest is Test {
         vm.expectEmit(true, true, true, true);
         emit IReactive.Callback(destinationChainId, callback, gasLimit, payload);
         sentinal.react(log);
+    }
+
+    function test_sentinal_stork_value_update_triggers_callback() external {
+        uint256 originChainId = 1;
+        uint256 destinationChainId = 1;
+        address market = address(0x1111);
+        address oracle = address(0);
+        address stork = address(0x5555);
+        bytes32 assetId = keccak256("ETH");
+        address executor = address(0);
+        address callback = address(0x2222);
+        uint64 gasLimit = 500_000;
+        uint256 cronTopic = 0;
+        uint256 batchSize = 7;
+
+        Sentinal sentinal = new Sentinal(
+            originChainId,
+            destinationChainId,
+            market,
+            oracle,
+            stork,
+            assetId,
+            executor,
+            callback,
+            gasLimit,
+            cronTopic,
+            batchSize,
+            1
+        );
+
+        IReactive.LogRecord memory log;
+        log.chain_id = originChainId;
+        log._contract = stork;
+        log.topic_0 = uint256(keccak256("ValueUpdate(bytes32,uint64,int192)"));
+        log.topic_1 = uint256(assetId);
+        log.data = abi.encode(uint64(123), int192(2_000_000));
+        log.block_number = 7;
+        log.tx_hash = 9;
+        log.log_index = 11;
+
+        bytes memory payload = _storkCallbackPayload(assetId, batchSize, log);
+
+        vm.expectEmit(true, true, true, true);
+        emit IReactive.Callback(destinationChainId, callback, gasLimit, payload);
+        sentinal.react(log);
+    }
+
+    function test_stork_price_update_triggers_liquidation_check_for_mapped_market() external {
+        Executor executor = new Executor(address(this), address(0xBEEF), address(0xCAFE));
+        executor.setInsolvencyThresholdMultiplier(0);
+
+        MockOracle oracle = new MockOracle();
+        MockMarket market = new MockMarket(oracle);
+        address account = address(0xA11CE);
+        bytes32 assetId = keccak256("ETH");
+
+        executor.setStorkAssetConfig(assetId, 1, 1);
+        executor.setMarketStorkAssetId(address(market), assetId);
+
+        RiskParameter memory r;
+        r.maintenance = UFixed6.wrap(100_000);
+        r.minMaintenance = UFixed6.wrap(0);
+        r.liquidationFee = UFixed6.wrap(50_000);
+        market.setRiskParameter(r);
+
+        OracleVersion memory v;
+        v.price = Fixed6.wrap(int256(2_000_000));
+        v.valid = true;
+        v.timestamp = block.timestamp;
+        oracle.setStatus(v, block.timestamp);
+
+        Position memory p;
+        p.size = Fixed6.wrap(int256(1_000_000));
+        p.entryPrice = Fixed6.wrap(int256(2_000_000));
+        market.setPosition(account, p);
+
+        Local memory l;
+        l.collateral = Fixed6.wrap(int256(300_000));
+        market.setLocal(account, l);
+
+        executor.trackAndCheck(address(this), address(market), account);
+        assertEq(market.lastUpdateAccount(), address(0));
+
+        v.price = Fixed6.wrap(int256(1_000_000));
+        v.valid = true;
+        v.timestamp = block.timestamp;
+        oracle.setStatus(v, block.timestamp);
+
+        _emitStorkUpdate(executor, assetId, int192(1_000_000));
+
+        assertEq(market.lastUpdateAccount(), account);
+        assertEq(market.lastUpdateProtect(), true);
+    }
+
+    function test_stork_price_update_does_not_bypass_perennial_oracle_staleness() external {
+        Executor executor = new Executor(address(this), address(0xBEEF), address(0xCAFE));
+        executor.setInsolvencyThresholdMultiplier(0);
+
+        MockOracle oracle = new MockOracle();
+        MockMarket market = new MockMarket(oracle);
+        address account = address(0xA11CE);
+        bytes32 assetId = keccak256("ETH");
+
+        executor.setStorkAssetConfig(assetId, 1, 1);
+        executor.setMarketStorkAssetId(address(market), assetId);
+
+        RiskParameter memory r;
+        r.maintenance = UFixed6.wrap(100_000);
+        r.minMaintenance = UFixed6.wrap(0);
+        r.liquidationFee = UFixed6.wrap(50_000);
+        r.staleAfter = 0;
+        market.setRiskParameter(r);
+
+        OracleVersion memory v;
+        v.price = Fixed6.wrap(int256(2_000_000));
+        v.valid = true;
+        v.timestamp = block.timestamp;
+        oracle.setStatus(v, block.timestamp);
+
+        Position memory p;
+        p.size = Fixed6.wrap(int256(1_000_000));
+        p.entryPrice = Fixed6.wrap(int256(2_000_000));
+        market.setPosition(account, p);
+
+        Local memory l;
+        l.collateral = Fixed6.wrap(int256(300_000));
+        market.setLocal(account, l);
+
+        executor.trackAndCheck(address(this), address(market), account);
+        assertEq(market.lastUpdateAccount(), address(0));
+
+        r.staleAfter = 1;
+        market.setRiskParameter(r);
+
+        vm.warp(10);
+        v.price = Fixed6.wrap(int256(1_000_000));
+        v.valid = true;
+        v.timestamp = 1;
+        oracle.setStatus(v, 1);
+
+        _emitStorkUpdate(executor, assetId, int192(1_000_000));
+
+        assertEq(market.lastUpdateAccount(), address(0));
     }
 
     function test_direct_liquidation_routes_realized_payout() external {

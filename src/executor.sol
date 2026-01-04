@@ -31,6 +31,23 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
     uint256 public makerRewardDiscountPpm;
     uint256 public insolvencyThresholdMultiplier;
 
+    struct StorkAssetConfig {
+        uint256 numerator;
+        uint256 denominator;
+    }
+
+    mapping(address => bytes32) public marketStorkAssetId;
+    mapping(bytes32 => address[]) public storkAssetMarkets;
+    mapping(bytes32 => mapping(address => uint256)) public storkAssetMarketIndex;
+    mapping(bytes32 => StorkAssetConfig) public storkAssetConfig;
+    mapping(bytes32 => uint64) public storkLatestTimestampNs;
+    mapping(bytes32 => int192) public storkLatestQuantizedValue;
+    mapping(bytes32 => int256) public storkLatestPriceFixed6;
+    mapping(bytes32 => uint256) public lastStorkEventId;
+    mapping(bytes32 => mapping(address => uint256)) public storkNextIndex;
+    mapping(bytes32 => mapping(address => bool)) public storkBatchInProgress;
+    mapping(bytes32 => mapping(address => uint256)) public lastStorkBatchEventId;
+
     mapping(address => mapping(address => bool)) public isTracked;
     mapping(address => address[]) public trackedAccounts;
     mapping(address => mapping(address => uint256)) public accountIndex;
@@ -80,6 +97,7 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
     event LiquidationExecuted(address indexed market, address indexed account, bool viaFlashLoan, uint256 reward);
     event LowProfitExecution(address indexed market, address indexed account, uint256 gained, uint256 cost);
     event PositionFactors(address indexed market, address indexed account, bytes data);
+    event StorkPriceUpdated(bytes32 indexed assetId, uint64 timestampNs, int192 quantizedValue, int256 priceFixed6);
 
     error NotOwner();
     error InvalidAddress();
@@ -189,6 +207,19 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
 
     function setInsolvencyThresholdMultiplier(uint256 newInsolvencyThresholdMultiplier) external onlyOwner {
         insolvencyThresholdMultiplier = newInsolvencyThresholdMultiplier;
+    }
+
+    function setStorkAssetConfig(bytes32 assetId, uint256 numerator, uint256 denominator) external onlyOwner {
+        storkAssetConfig[assetId] = StorkAssetConfig({numerator: numerator, denominator: denominator});
+    }
+
+    function setMarketStorkAssetId(address market, bytes32 assetId) external onlyOwner {
+        if (market == address(0)) revert InvalidAddress();
+        bytes32 prev = marketStorkAssetId[market];
+        if (prev == assetId) return;
+        if (prev != bytes32(0)) _removeMarketFromStorkAsset(prev, market);
+        marketStorkAssetId[market] = assetId;
+        if (assetId != bytes32(0)) _addMarketToStorkAsset(assetId, market);
     }
 
     function oraclePrice(IMarket market) public view returns (int256) {
@@ -442,6 +473,28 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         isTracked[market][removed] = false;
     }
 
+    function _addMarketToStorkAsset(bytes32 assetId, address market) internal {
+        if (storkAssetMarketIndex[assetId][market] != 0) return;
+        storkAssetMarketIndex[assetId][market] = storkAssetMarkets[assetId].length + 1;
+        storkAssetMarkets[assetId].push(market);
+    }
+
+    function _removeMarketFromStorkAsset(bytes32 assetId, address market) internal {
+        uint256 idxPlusOne = storkAssetMarketIndex[assetId][market];
+        if (idxPlusOne == 0) return;
+        uint256 index = idxPlusOne - 1;
+
+        address[] storage markets = storkAssetMarkets[assetId];
+        uint256 lastIndex = markets.length - 1;
+        if (index != lastIndex) {
+            address last = markets[lastIndex];
+            markets[index] = last;
+            storkAssetMarketIndex[assetId][last] = index + 1;
+        }
+        markets.pop();
+        delete storkAssetMarketIndex[assetId][market];
+    }
+
     function trackAndCheck(address rvmId, address market, address account)
         external
         authorizedSenderOnly
@@ -501,6 +554,91 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         }
         _processNextBatch(market, maxCount);
         if (nextIndex[market] == 0) batchInProgress[market] = false;
+    }
+
+    function storkValueUpdateEvent(
+        address rvmId,
+        bytes32 assetId,
+        uint64 timestampNs,
+        int192 quantizedValue,
+        uint256 maxCount,
+        uint256 originChainId,
+        uint256 originBlockNumber,
+        uint256 originTxHash,
+        uint256 originLogIndex,
+        uint256 originTopic0
+    ) external authorizedSenderOnly rvmIdOnly(rvmId) {
+        uint256 eventId = _storkEventId(
+            assetId, originChainId, originBlockNumber, originTxHash, originLogIndex, originTopic0
+        );
+        _applyStorkUpdate(assetId, timestampNs, quantizedValue, eventId);
+        _triggerStorkBatches(assetId, maxCount, eventId);
+    }
+
+    function _storkEventId(
+        bytes32 assetId,
+        uint256 originChainId,
+        uint256 originBlockNumber,
+        uint256 originTxHash,
+        uint256 originLogIndex,
+        uint256 originTopic0
+    ) internal pure returns (uint256) {
+        return uint256(
+            keccak256(abi.encode(assetId, originChainId, originBlockNumber, originTxHash, originLogIndex, originTopic0))
+        );
+    }
+
+    function _applyStorkUpdate(bytes32 assetId, uint64 timestampNs, int192 quantizedValue, uint256 eventId) internal {
+        if (lastStorkEventId[assetId] == eventId) return;
+        lastStorkEventId[assetId] = eventId;
+        storkLatestTimestampNs[assetId] = timestampNs;
+        storkLatestQuantizedValue[assetId] = quantizedValue;
+        int256 priceFixed6 = _storkQuantizedToFixed6(assetId, quantizedValue);
+        storkLatestPriceFixed6[assetId] = priceFixed6;
+        emit StorkPriceUpdated(assetId, timestampNs, quantizedValue, priceFixed6);
+    }
+
+    function _triggerStorkBatches(bytes32 assetId, uint256 maxCount, uint256 eventId) internal {
+        address[] storage markets = storkAssetMarkets[assetId];
+        for (uint256 i = 0; i < markets.length; i++) {
+            _processNextStorkBatchEvent(markets[i], assetId, maxCount, eventId);
+        }
+    }
+
+    function _processNextStorkBatchEvent(address market, bytes32 assetId, uint256 maxCount, uint256 eventId) internal {
+        if (lastStorkBatchEventId[assetId][market] != eventId) {
+            lastStorkBatchEventId[assetId][market] = eventId;
+            storkBatchInProgress[assetId][market] = true;
+            storkNextIndex[assetId][market] = 0;
+        } else {
+            if (!storkBatchInProgress[assetId][market]) return;
+        }
+        _processNextStorkBatch(market, assetId, maxCount);
+        if (storkNextIndex[assetId][market] == 0) storkBatchInProgress[assetId][market] = false;
+    }
+
+    function _processNextStorkBatch(address market, bytes32 assetId, uint256 maxCount) internal {
+        address[] storage accounts = trackedAccounts[market];
+        uint256 i = storkNextIndex[assetId][market];
+        uint256 processed = 0;
+        while (processed < maxCount && i < accounts.length) {
+            address account = accounts[i];
+            if (!_hasPosition(market, account)) {
+                _untrackAtIndex(market, i);
+                continue;
+            }
+            if (_storkIndicatesUndercollateralized(market, account, assetId)) {
+                _checkAndExecute(market, account);
+            }
+            processed++;
+            i++;
+        }
+
+        if (accounts.length == 0) {
+            storkNextIndex[assetId][market] = 0;
+        } else {
+            storkNextIndex[assetId][market] = i >= accounts.length ? 0 : i;
+        }
     }
 
     function _processNextBatch(address market, uint256 maxCount) internal {
@@ -613,6 +751,51 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
 
     function claimToProfitReceiver(address market) external onlyOwner {
         IMarket(market).claimFee(profitReceiver);
+    }
+
+    function _storkQuantizedToFixed6(bytes32 assetId, int192 quantizedValue) internal view returns (int256) {
+        StorkAssetConfig memory cfg = storkAssetConfig[assetId];
+        if (cfg.denominator == 0 || cfg.numerator == 0) return 0;
+        return (int256(quantizedValue) * int256(cfg.numerator)) / int256(cfg.denominator);
+    }
+
+    function _storkIndicatesUndercollateralized(address market, address account, bytes32 assetId)
+        internal
+        view
+        returns (bool)
+    {
+        if (marketStorkAssetId[market] != assetId) return false;
+        int256 price = storkLatestPriceFixed6[assetId];
+        if (price == 0) return true;
+
+        IMarket m = IMarket(market);
+        Position memory p = m.positions(account);
+        int256 size = Fixed6.unwrap(p.size);
+
+        uint256 notional_ = notional(size, price);
+        if (notional_ == 0) return false;
+
+        RiskParameter memory r = m.riskParameter();
+        uint256 maintenanceRequirement =
+            computeMaintenanceRequirement(notional_, UFixed6.unwrap(r.maintenance), UFixed6.unwrap(r.minMaintenance));
+
+        uint256 buffer = liquidationBuffer;
+        uint256 makerSize = _makerSize(m, account);
+        if (makerSize != 0 && makerSize >= minMakerSize) buffer = makerLiquidationBuffer;
+
+        Local memory l = m.locals(account);
+        return isLiquidatable(
+            equity(
+                Fixed6.unwrap(l.collateral),
+                size,
+                price,
+                Fixed6.unwrap(p.entryPrice),
+                Fixed6.unwrap(p.accruedFunding),
+                Fixed6.unwrap(p.accruedFees)
+            ),
+            maintenanceRequirement,
+            buffer
+        );
     }
 
     function _abs(int256 x) internal pure returns (uint256) {
