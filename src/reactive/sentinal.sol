@@ -60,12 +60,12 @@ contract Sentinal is AbstractReactive {
                     originChainId_, oracle_, REACTIVE_IGNORE, REACTIVE_IGNORE, REACTIVE_IGNORE, REACTIVE_IGNORE
                 );
             }
-            if (stork_ != address(0) && storkAssetId_ != bytes32(0)) {
+            if (stork_ != address(0)) {
                 service.subscribe(
                     originChainId_,
                     stork_,
                     STORK_VALUE_UPDATE_TOPIC0,
-                    uint256(storkAssetId_),
+                    storkAssetId_ == bytes32(0) ? REACTIVE_IGNORE : uint256(storkAssetId_),
                     REACTIVE_IGNORE,
                     REACTIVE_IGNORE
                 );
@@ -143,13 +143,14 @@ contract Sentinal is AbstractReactive {
         }
         if (
             stork != address(0) && log._contract == stork && log.topic_0 == STORK_VALUE_UPDATE_TOPIC0
-                && log.topic_1 == uint256(storkAssetId)
+                && (storkAssetId == bytes32(0) || log.topic_1 == uint256(storkAssetId))
         ) {
+            bytes32 assetId = storkAssetId == bytes32(0) ? bytes32(log.topic_1) : storkAssetId;
             (uint64 timestampNs, int192 quantizedValue) = abi.decode(log.data, (uint64, int192));
             bytes memory storkPayload = abi.encodeWithSignature(
                 "storkValueUpdateEvent(address,bytes32,uint64,int192,uint256,uint256,uint256,uint256,uint256,uint256)",
                 address(0),
-                storkAssetId,
+                assetId,
                 timestampNs,
                 quantizedValue,
                 batchSize,
