@@ -36,6 +36,14 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         uint256 denominator;
     }
 
+    struct TokenStorkConfig {
+        bytes32 assetId;
+        uint256 numerator;
+        uint256 denominator;
+    }
+
+    mapping(address => TokenStorkConfig) public tokenStorkConfig;
+
     mapping(address => bytes32) public marketStorkAssetId;
     mapping(bytes32 => address[]) public storkAssetMarkets;
     mapping(bytes32 => mapping(address => uint256)) public storkAssetMarketIndex;
@@ -214,12 +222,49 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
     }
 
     function setMarketStorkAssetId(address market, bytes32 assetId) external onlyOwner {
+        _setMarketStorkAssetId(market, assetId);
+    }
+
+    function setTokenStorkConfig(address token, bytes32 assetId, uint256 numerator, uint256 denominator)
+        external
+        onlyOwner
+    {
+        if (token == address(0)) revert InvalidAddress();
+        tokenStorkConfig[token] = TokenStorkConfig({assetId: assetId, numerator: numerator, denominator: denominator});
+        if (assetId != bytes32(0) && numerator != 0 && denominator != 0) {
+            StorkAssetConfig memory existing = storkAssetConfig[assetId];
+            if (existing.numerator == 0 || existing.denominator == 0) {
+                storkAssetConfig[assetId] = StorkAssetConfig({numerator: numerator, denominator: denominator});
+            }
+        }
+    }
+
+    function _setMarketStorkAssetId(address market, bytes32 assetId) internal {
         if (market == address(0)) revert InvalidAddress();
         bytes32 prev = marketStorkAssetId[market];
         if (prev == assetId) return;
         if (prev != bytes32(0)) _removeMarketFromStorkAsset(prev, market);
         marketStorkAssetId[market] = assetId;
         if (assetId != bytes32(0)) _addMarketToStorkAsset(assetId, market);
+    }
+
+    function _autoLinkMarketToStorkAsset(address market) internal returns (bytes32 assetId) {
+        assetId = marketStorkAssetId[market];
+        if (assetId != bytes32(0)) return assetId;
+
+        address token = _marketToken(market);
+        TokenStorkConfig memory cfg = tokenStorkConfig[token];
+        if (cfg.assetId == bytes32(0)) return bytes32(0);
+
+        _setMarketStorkAssetId(market, cfg.assetId);
+        if (cfg.numerator != 0 && cfg.denominator != 0) {
+            StorkAssetConfig memory existing = storkAssetConfig[cfg.assetId];
+            if (existing.numerator == 0 || existing.denominator == 0) {
+                storkAssetConfig[cfg.assetId] =
+                    StorkAssetConfig({numerator: cfg.numerator, denominator: cfg.denominator});
+            }
+        }
+        return cfg.assetId;
     }
 
     function oraclePrice(IMarket market) public view returns (int256) {
@@ -417,32 +462,8 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         authorizedSenderOnly
         rvmIdOnly(rvmId)
     {
-        _checkAndExecute(market, account);
-    }
-
-    function _checkAndExecute(address market, address account) internal {
-        Factors memory f = _factorsStruct(IMarket(market), account);
-        emit LiquidationCheck(market, account, f.liquidatable, f.maintenanceRequirement, f.equityValue);
-        emit PositionFactors(market, account, abi.encode(f));
-        if (!f.liquidatable) return;
-        if (!profitable(f.reward, 0)) return;
-        address asset = _marketToken(market);
-        uint256 balanceBefore = asset == address(0) ? 0 : _balanceOf(asset, address(this));
-        IMarket(market).update(account, 0, 0, 0, 0, true);
-        try IMarket(market).claimFee(address(this)) {} catch {}
-        if (asset != address(0)) {
-            uint256 balanceAfter = _balanceOf(asset, address(this));
-            uint256 gained = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0;
-            uint256 cost = gasCost() + safetyMargin + minProfit;
-            if (gained < cost) {
-                emit LowProfitExecution(market, account, gained, cost);
-            }
-            if (gained != 0) {
-                _transfer(asset, profitReceiver, gained);
-                emit RealizedPayout(market, account, asset, gained);
-            }
-        }
-        emit LiquidationExecuted(market, account, false, f.reward);
+        _autoLinkMarketToStorkAsset(market);
+        _checkAndExecuteWithFlashLoanFromMarket(market, account);
     }
 
     function _hasPosition(address market, address account) internal view returns (bool) {
@@ -500,8 +521,9 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         authorizedSenderOnly
         rvmIdOnly(rvmId)
     {
+        _autoLinkMarketToStorkAsset(market);
         _trackAccount(market, account);
-        _checkAndExecute(market, account);
+        _checkAndExecuteWithFlashLoanFromMarket(market, account);
     }
 
     function trackAndCheckEvent(
@@ -520,8 +542,9 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         if (lastAccountEventId[market][account] == eventId) return;
         lastAccountEventId[market][account] = eventId;
 
+        _autoLinkMarketToStorkAsset(market);
         _trackAccount(market, account);
-        _checkAndExecute(market, account);
+        _checkAndExecuteWithFlashLoanFromMarket(market, account);
     }
 
     function processNextBatch(address rvmId, address market, uint256 maxCount)
@@ -628,7 +651,7 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
                 continue;
             }
             if (_storkIndicatesUndercollateralized(market, account, assetId)) {
-                _checkAndExecute(market, account);
+                _checkAndExecuteWithFlashLoanFromMarket(market, account);
             }
             processed++;
             i++;
@@ -651,7 +674,7 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
                 _untrackAtIndex(market, i);
                 continue;
             }
-            _checkAndExecute(market, account);
+            _checkAndExecuteWithFlashLoanFromMarket(market, account);
             processed++;
             i++;
         }
@@ -683,6 +706,12 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         authorizedSenderOnly
         rvmIdOnly(rvmId)
     {
+        _checkAndExecuteWithFlashLoanInternal(market, account, asset, amount);
+    }
+
+    function _checkAndExecuteWithFlashLoanInternal(address market, address account, address asset, uint256 amount)
+        internal
+    {
         Factors memory f = _factorsStruct(IMarket(market), account);
         emit LiquidationCheck(market, account, f.liquidatable, f.maintenanceRequirement, f.equityValue);
         emit PositionFactors(market, account, abi.encode(f));
@@ -691,6 +720,25 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
         if (!profitable(f.reward, estimatedFlashFee)) return;
 
         aavePool.flashLoanSimple(address(this), asset, amount, abi.encode(market, account, f.reward), 0);
+    }
+
+    function _checkAndExecuteWithFlashLoanFromMarket(address market, address account) internal {
+        Factors memory f = _factorsStruct(IMarket(market), account);
+        emit LiquidationCheck(market, account, f.liquidatable, f.maintenanceRequirement, f.equityValue);
+        emit PositionFactors(market, account, abi.encode(f));
+        if (!f.liquidatable) return;
+        uint256 amount = _flashLoanAmountFromFactors(f);
+        uint256 estimatedFlashFee = (amount * _flashLoanPremiumTotalBps()) / BPS_DIVISOR;
+        if (!profitable(f.reward, estimatedFlashFee)) return;
+
+        address asset = _marketToken(market);
+        if (asset == address(0)) revert InvalidAddress();
+        aavePool.flashLoanSimple(address(this), asset, amount, abi.encode(market, account, f.reward), 0);
+    }
+
+    function _flashLoanAmountFromFactors(Factors memory f) internal pure returns (uint256) {
+        if (f.maintenanceRequirement != 0) return f.maintenanceRequirement;
+        return 1;
     }
 
     function executeOperation(address asset, uint256 amount, uint256 premium, address initiator, bytes calldata params)
@@ -725,7 +773,10 @@ contract Executor is AbstractCallback, IAaveFlashLoanSimpleReceiver {
 
         uint256 cost = gasCost() + safetyMargin + minProfit;
         if (profit < cost) revert InsufficientProfit();
-        if (profit != 0) _transfer(asset, profitReceiver, profit);
+        if (profit != 0) {
+            _transfer(asset, profitReceiver, profit);
+            emit RealizedPayout(market, account, asset, profit);
+        }
     }
 
     function _makerSize(IMarket market, address account) internal view returns (uint256) {

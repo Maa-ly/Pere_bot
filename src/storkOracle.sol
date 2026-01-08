@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.29;
 
-import "@storknetwork/stork-evm-sdk/IStork.sol";
-import "@storknetwork/stork-evm-sdk/StorkStructs.sol";
+import {IStork} from "@storknetwork/stork-evm-sdk/IStork.sol";
 
 contract StorkOracle {
-    address public stork;
+    IStork public stork;
 
     error InvalidAddress();
 }
