@@ -45,3 +45,17 @@ Margin
 │  ✓ Maker higher buffer          ✓ Dynamic gas estimation        │
 │  ✓ Realized profit verification ✓ L2 gas oracle support         │
 └─────────────────────────────────────────────────────────────────┘
+
+
+
+## clones
+- so i can have multiple sentinals i can clone anytime i want, like a sentinal factory,
+- each sentinal canhandle differnet accounts and assets
+- to liquidate positions faster so i don't miss out
+
+
+-- sentinal clone factory ---
+Okay 
+
+
+
